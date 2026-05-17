@@ -270,7 +270,29 @@ async def fetch_album_tracks(playlist_id: int) -> dict | None:
                 if resp.status != 200:
                     logger.warning(f"[ALBUM] HTTP {resp.status} for playlist {playlist_id}")
                     return None
-                return await resp.json()
+                data = await resp.json()
+
+            # SoundCloud only returns full data for first ~5 tracks
+            # The rest are mini-objects with just "id". Fetch full info for those.
+            tracks = data.get("tracks", [])
+            incomplete_ids = [t["id"] for t in tracks if not t.get("title")]
+            if incomplete_ids:
+                # Fetch in batches of 50
+                for i in range(0, len(incomplete_ids), 50):
+                    batch = incomplete_ids[i:i+50]
+                    ids_str = ",".join(str(x) for x in batch)
+                    tracks_url = "https://api-v2.soundcloud.com/tracks"
+                    async with session.get(tracks_url, params={"ids": ids_str, "client_id": client_id}) as resp2:
+                        if resp2.status == 200:
+                            full_tracks = await resp2.json()
+                            full_map = {t["id"]: t for t in full_tracks}
+                            # Replace mini-objects with full data
+                            for j, t in enumerate(tracks):
+                                if t["id"] in full_map:
+                                    tracks[j] = full_map[t["id"]]
+
+            data["tracks"] = tracks
+            return data
         except Exception as e:
             logger.error(f"[ALBUM] Failed: {e}")
             return None
