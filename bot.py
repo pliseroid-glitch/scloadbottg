@@ -260,8 +260,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я инлайн-бот для скачивания треков с SoundCloud.\n\n"
         "Используй меня в любом чате:\n"
-        "@gayleomatchbot название трека — скачать с SoundCloud\n"
-        "@gayleomatchbot text название — получить текст песни\n\n"
+        "@pliserloadbot название трека — скачать с SoundCloud\n"
+        "@pliserloadbot название text — получить текст песни\n\n"
         "Выбери трек — он появится прямо в чате."
     )
 
@@ -319,9 +319,15 @@ def fetch_lyrics(song_url: str) -> str | None:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
         }
+        logger.info(f"[LYRICS] Fetching: {song_url}")
         page = requests.get(song_url, headers=headers, timeout=10)
+        logger.info(f"[LYRICS] Page status: {page.status_code}, length: {len(page.text)}")
+        if page.status_code != 200:
+            logger.error(f"[LYRICS] Page returned {page.status_code}")
+            return None
         soup = BeautifulSoup(page.text, "html.parser")
         lyrics_divs = soup.select('div[data-lyrics-container="true"]')
+        logger.info(f"[LYRICS] Found {len(lyrics_divs)} lyrics divs")
         if lyrics_divs:
             lyrics = "\n".join(
                 div.get_text(separator="\n") for div in lyrics_divs
@@ -334,9 +340,14 @@ def fetch_lyrics(song_url: str) -> str | None:
             # Remove last line if it's embed junk
             while lines and any(x in lines[-1] for x in ["Embed", "URLCopy", "You might also like"]):
                 lines.pop()
-            return "\n".join(lines).strip()
+            result = "\n".join(lines).strip()
+            logger.info(f"[LYRICS] Got {len(result)} chars of lyrics")
+            return result if result else None
+        else:
+            logger.warning("[LYRICS] No lyrics containers found on page")
+            return None
     except Exception as e:
-        logger.error(f"[LYRICS] Fetch failed: {e}")
+        logger.error(f"[LYRICS] Fetch failed: {type(e).__name__}: {e}")
     return None
 
 
