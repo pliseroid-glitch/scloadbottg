@@ -310,42 +310,32 @@ def search_lyrics(query: str) -> list[dict]:
 
 
 def fetch_lyrics(song_url: str) -> str | None:
-    """Fetch full lyrics for a song. Runs in thread."""
+    """Fetch full lyrics for a song using Genius API + page scraping."""
     if not GENIUS_TOKEN:
         return None
     try:
-        from bs4 import BeautifulSoup
-        import requests
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
-        }
-        logger.info(f"[LYRICS] Fetching: {song_url}")
-        page = requests.get(song_url, headers=headers, timeout=10)
-        logger.info(f"[LYRICS] Page status: {page.status_code}, length: {len(page.text)}")
-        if page.status_code != 200:
-            logger.error(f"[LYRICS] Page returned {page.status_code}")
+        import lyricsgenius
+        genius = lyricsgenius.Genius(GENIUS_TOKEN, verbose=False, remove_section_headers=False)
+        genius.timeout = 15
+
+        # Extract song path from URL, e.g. "Sqwore-ufo-lyrics"
+        # Use genius.lyrics() which handles scraping internally
+        lyrics = genius.lyrics(song_url=song_url)
+        if not lyrics:
+            logger.warning(f"[LYRICS] genius.lyrics() returned empty for {song_url}")
             return None
-        soup = BeautifulSoup(page.text, "html.parser")
-        lyrics_divs = soup.select('div[data-lyrics-container="true"]')
-        logger.info(f"[LYRICS] Found {len(lyrics_divs)} lyrics divs")
-        if lyrics_divs:
-            lyrics = "\n".join(
-                div.get_text(separator="\n") for div in lyrics_divs
-            )
-            # Clean up Genius junk
-            lines = lyrics.strip().split("\n")
-            # Remove first line if it contains "Lyrics" header junk
-            if lines and ("Lyrics" in lines[0] or "Contributors" in lines[0]):
-                lines = lines[1:]
-            # Remove last line if it's embed junk
-            while lines and any(x in lines[-1] for x in ["Embed", "URLCopy", "You might also like"]):
-                lines.pop()
-            result = "\n".join(lines).strip()
-            logger.info(f"[LYRICS] Got {len(result)} chars of lyrics")
-            return result if result else None
-        else:
-            logger.warning("[LYRICS] No lyrics containers found on page")
-            return None
+
+        # Clean up Genius junk
+        lines = lyrics.strip().split("\n")
+        # Remove first line if it contains "Lyrics" header junk
+        if lines and ("Lyrics" in lines[0] or "Contributors" in lines[0]):
+            lines = lines[1:]
+        # Remove last line if it's embed junk
+        while lines and any(x in lines[-1] for x in ["Embed", "URLCopy", "You might also like"]):
+            lines.pop()
+        result = "\n".join(lines).strip()
+        logger.info(f"[LYRICS] Got {len(result)} chars of lyrics")
+        return result if result else None
     except Exception as e:
         logger.error(f"[LYRICS] Fetch failed: {type(e).__name__}: {e}")
     return None
