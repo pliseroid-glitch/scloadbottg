@@ -309,32 +309,72 @@ def search_lyrics(query: str) -> list[dict]:
         return []
 
 
-def fetch_lyrics(song_url: str) -> str | None:
-    """Fetch full lyrics for a song using Genius API + page scraping."""
+def fetch_lyrics(song_url: str, song_id: int = None) -> str | None:
+    """Fetch lyrics. Try Genius API search_song, fallback to page scraping."""
     if not GENIUS_TOKEN:
         return None
     try:
-        import lyricsgenius
-        genius = lyricsgenius.Genius(GENIUS_TOKEN, verbose=False, remove_section_headers=False)
-        genius.timeout = 15
+        import requests
 
-        # Extract song path from URL, e.g. "Sqwore-ufo-lyrics"
-        # Use genius.lyrics() which handles scraping internally
-        lyrics = genius.lyrics(song_url=song_url)
-        if not lyrics:
-            logger.warning(f"[LYRICS] genius.lyrics() returned empty for {song_url}")
+        # Method 1: Use Genius API to get song path, then fetch via their CDN
+        # The /songs/:id endpoint has a "path" we can use
+        if song_id:
+            headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
+            resp = requests.get(
+                f"https://api.genius.com/songs/{song_id}",
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                song_data = resp.json().get("response", {}).get("song", {})
+                # Try to get lyrics from the embed
+                embed_url = song_data.get("embed_content")
+                song_path = song_data.get("path", "")
+
+        # Method 2: Scrape with proper headers
+        headers_scrape = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.google.com/",
+            "DNT": "1",
+        }
+        logger.info(f"[LYRICS] Scraping: {song_url}")
+        page = requests.get(song_url, headers=headers_scrape, timeout=15)
+        logger.info(f"[LYRICS] Status: {page.status_code}")
+
+        if page.status_code == 403:
+            # Try with a different approach — mobile user agent
+            headers_scrape["User-Agent"] = (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            )
+            page = requests.get(song_url, headers=headers_scrape, timeout=15)
+            logger.info(f"[LYRICS] Retry mobile UA status: {page.status_code}")
+
+        if page.status_code != 200:
+            logger.error(f"[LYRICS] Cannot access page: {page.status_code}")
             return None
 
-        # Clean up Genius junk
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(page.text, "html.parser")
+        lyrics_divs = soup.select('div[data-lyrics-container="true"]')
+        if not lyrics_divs:
+            logger.warning("[LYRICS] No lyrics containers found")
+            return None
+
+        lyrics = "\n".join(div.get_text(separator="\n") for div in lyrics_divs)
         lines = lyrics.strip().split("\n")
-        # Remove first line if it contains "Lyrics" header junk
         if lines and ("Lyrics" in lines[0] or "Contributors" in lines[0]):
             lines = lines[1:]
-        # Remove last line if it's embed junk
         while lines and any(x in lines[-1] for x in ["Embed", "URLCopy", "You might also like"]):
             lines.pop()
         result = "\n".join(lines).strip()
-        logger.info(f"[LYRICS] Got {len(result)} chars of lyrics")
+        logger.info(f"[LYRICS] Got {len(result)} chars")
         return result if result else None
     except Exception as e:
         logger.error(f"[LYRICS] Fetch failed: {type(e).__name__}: {e}")
@@ -475,6 +515,7 @@ async def handle_lyrics_inline(update: Update, context: ContextTypes.DEFAULT_TYP
             "title": title,
             "artist": artist,
             "url": song["url"],
+            "song_id": song.get("id"),
         }
 
     # Trim
@@ -634,13 +675,14 @@ async def handle_chosen_lyrics(context: ContextTypes.DEFAULT_TYPE, inline_messag
     title = info["title"]
     artist = info["artist"]
     song_url = info["url"]
+    song_id = info.get("song_id")
 
     if not inline_message_id:
         logger.warning("[LYRICS] No inline_message_id")
         return
 
     loop = asyncio.get_event_loop()
-    lyrics = await loop.run_in_executor(None, fetch_lyrics, song_url)
+    lyrics = await loop.run_in_executor(None, fetch_lyrics, song_url, song_id)
 
     if not lyrics:
         try:
