@@ -21,6 +21,7 @@ from telegram.ext import (
     ChosenInlineResultHandler,
     ContextTypes,
     CommandHandler,
+    CallbackQueryHandler,
 )
 
 load_dotenv()
@@ -256,7 +257,86 @@ async def download_artwork(url: str) -> bytes | None:
     return None
 
 
+async def fetch_album_tracks(playlist_id: int) -> dict | None:
+    """Fetch album/playlist info and its tracks from SoundCloud."""
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
+        client_id = await get_soundcloud_client_id(session)
+        if not client_id:
+            return None
+        url = f"https://api-v2.soundcloud.com/playlists/{playlist_id}"
+        params = {"client_id": client_id}
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[ALBUM] HTTP {resp.status} for playlist {playlist_id}")
+                    return None
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"[ALBUM] Failed: {e}")
+            return None
+
+
+async def get_track_album(track: dict) -> dict | None:
+    """Check if a track belongs to an album/playlist. Returns album info or None."""
+    # SoundCloud API: track has 'publisher_metadata' with 'album_title'
+    # But to get the actual playlist we need to search
+    # The track object from search may have 'playlist' or we check via user's playlists
+    # Simpler: check if track has publisher_metadata.album_title
+    pub = track.get("publisher_metadata") or {}
+    album_title = pub.get("album_title")
+    if not album_title:
+        return None
+
+    # Search for the album by the same artist
+    artist = track.get("user", {}).get("permalink", "")
+    if not artist:
+        return None
+
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
+        client_id = await get_soundcloud_client_id(session)
+        if not client_id:
+            return None
+        # Search playlists by artist
+        url = f"https://api-v2.soundcloud.com/users/{track['user']['id']}/playlists"
+        params = {"client_id": client_id, "limit": 50}
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                playlists = data.get("collection", [])
+                for pl in playlists:
+                    if pl.get("title", "").lower() == album_title.lower():
+                        return {
+                            "id": pl.get("id"),
+                            "title": pl.get("title"),
+                            "artist": track.get("user", {}).get("username", "Unknown"),
+                            "artwork": pl.get("artwork_url") or track.get("artwork_url"),
+                            "track_count": pl.get("track_count", 0),
+                        }
+        except Exception as e:
+            logger.warning(f"[ALBUM] Search failed: {e}")
+    return None
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args and args[0].startswith("track_"):
+        # Deep link: download single track
+        track_id_str = args[0][6:]
+        await handle_track_deeplink(update, context, track_id_str)
+        return
+    elif args and args[0].startswith("album_"):
+        # Deep link: show album
+        album_id_str = args[0][6:]
+        await handle_album_deeplink(update, context, album_id_str)
+        return
+    elif args and args[0].startswith("dlall_"):
+        # Deep link: download all tracks from album
+        album_id_str = args[0][6:]
+        await handle_download_all(update, context, album_id_str)
+        return
+
     await update.message.reply_text(
         "Привет! Я инлайн-бот для скачивания треков с SoundCloud.\n\n"
         "Используй меня в любом чате:\n"
@@ -264,6 +344,209 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "@pliserloadbot название text — получить текст песни\n\n"
         "Выбери трек — он появится прямо в чате."
     )
+
+
+async def handle_track_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, track_id_str: str):
+    """Handle /start track_XXXXX — download and send a single track."""
+    try:
+        track_id = int(track_id_str)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID трека.")
+        return
+
+    await update.message.reply_text("⏳ Скачиваю трек...")
+
+    # Check cache first
+    cached = cache_get(track_id)
+    if cached:
+        try:
+            await context.bot.send_audio(chat_id=update.effective_chat.id, audio=cached)
+            return
+        except Exception:
+            pass
+
+    # Fetch track info
+    async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
+        client_id = await get_soundcloud_client_id(session)
+        if not client_id:
+            await update.message.reply_text("❌ Не удалось подключиться к SoundCloud.")
+            return
+        track = await fetch_track_fresh(session, track_id, client_id)
+
+    if not track:
+        await update.message.reply_text("❌ Трек не найден.")
+        return
+
+    title = track.get("title", "track")
+    artist = track.get("user", {}).get("username", "Unknown")
+    duration = track.get("duration", 0) // 1000
+    artwork = track.get("artwork_url") or ""
+
+    file_path = await download_track(track)
+    if not file_path:
+        await update.message.reply_text(f"❌ Не удалось скачать: {title}")
+        return
+
+    thumb_bytes = None
+    if artwork:
+        thumb_bytes = await download_artwork(artwork.replace("-large", "-t500x500"))
+
+    storage_chat = os.getenv("STORAGE_CHAT_ID")
+    try:
+        with open(file_path, "rb") as f:
+            kwargs = {
+                "chat_id": update.effective_chat.id,
+                "audio": f,
+                "title": title,
+                "performer": artist,
+                "duration": duration,
+            }
+            if thumb_bytes:
+                kwargs["thumbnail"] = thumb_bytes
+            msg = await context.bot.send_audio(**kwargs)
+            if msg.audio:
+                cache_set(track_id, msg.audio.file_id)
+    except Exception as e:
+        logger.error(f"[DEEPLINK] send failed: {e}")
+        await update.message.reply_text(f"❌ Ошибка отправки: {title}")
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
+
+async def handle_album_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, album_id_str: str):
+    """Handle /start album_XXXXX — show album tracklist."""
+    try:
+        album_id = int(album_id_str)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID альбома.")
+        return
+
+    album_data = await fetch_album_tracks(album_id)
+    if not album_data:
+        await update.message.reply_text("❌ Альбом не найден.")
+        return
+
+    title = album_data.get("title", "Album")
+    artist = album_data.get("user", {}).get("username", "Unknown")
+    artwork = album_data.get("artwork_url") or ""
+    tracks = album_data.get("tracks", [])
+
+    if not tracks:
+        await update.message.reply_text("❌ В альбоме нет треков.")
+        return
+
+    # Build tracklist with deep links
+    bot_username = (await context.bot.get_me()).username
+    lines = [f"📀 {artist} – {title}\n"]
+    for i, t in enumerate(tracks, 1):
+        t_title = t.get("title", "?")
+        t_id = t.get("id", 0)
+        lines.append(f'{i} · <a href="https://t.me/{bot_username}?start=track_{t_id}">{t_title}</a>')
+
+    text = "\n".join(lines)
+    if len(text) > 4096:
+        text = text[:4090] + "..."
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬇️ Скачать все", url=f"https://t.me/{bot_username}?start=dlall_{album_id}")
+    ]])
+
+    # Send artwork if available
+    if artwork:
+        thumb = await download_artwork(artwork.replace("-large", "-t500x500"))
+        if thumb:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=thumb,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return
+
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE, album_id_str: str):
+    """Handle /start dlall_XXXXX — download all tracks from album."""
+    try:
+        album_id = int(album_id_str)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID альбома.")
+        return
+
+    album_data = await fetch_album_tracks(album_id)
+    if not album_data:
+        await update.message.reply_text("❌ Альбом не найден.")
+        return
+
+    title = album_data.get("title", "Album")
+    tracks = album_data.get("tracks", [])
+
+    if not tracks:
+        await update.message.reply_text("❌ В альбоме нет треков.")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"⏳ Скачиваю альбом: {title} ({len(tracks)} треков)..."
+    )
+
+    success = 0
+    for i, t in enumerate(tracks, 1):
+        t_id = t.get("id")
+        t_title = t.get("title", "?")
+        t_artist = t.get("user", {}).get("username", "Unknown")
+        t_duration = t.get("duration", 0) // 1000
+        t_artwork = t.get("artwork_url") or ""
+
+        # Check cache
+        cached = cache_get(t_id) if t_id else None
+        if cached:
+            try:
+                await context.bot.send_audio(chat_id=update.effective_chat.id, audio=cached)
+                success += 1
+                continue
+            except Exception:
+                pass
+
+        file_path = await download_track(t)
+        if not file_path:
+            continue
+
+        thumb_bytes = None
+        if t_artwork:
+            thumb_bytes = await download_artwork(t_artwork.replace("-large", "-t500x500"))
+
+        try:
+            with open(file_path, "rb") as f:
+                kwargs = {
+                    "chat_id": update.effective_chat.id,
+                    "audio": f,
+                    "title": t_title,
+                    "performer": t_artist,
+                    "duration": t_duration,
+                }
+                if thumb_bytes:
+                    kwargs["thumbnail"] = thumb_bytes
+                msg = await context.bot.send_audio(**kwargs)
+                if msg.audio and t_id:
+                    cache_set(t_id, msg.audio.file_id)
+                success += 1
+        except Exception as e:
+            logger.error(f"[DLALL] Failed to send {t_title}: {e}")
+        finally:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+    try:
+        await status_msg.edit_text(f"✅ Альбом: {title}\nОтправлено: {success}/{len(tracks)} треков")
+    except Exception:
+        pass
 
 
 def search_lyrics(query: str) -> list[dict]:
@@ -647,6 +930,19 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
     # Replace inline message with audio using editMessageMedia
     if inline_message_id:
         from telegram import InputMediaAudio
+
+        # Check if track belongs to an album
+        album_info = await get_track_album(track)
+        album_keyboard = None
+        if album_info:
+            bot_username = (await context.bot.get_me()).username
+            album_keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"📀 {album_info['title']}",
+                    url=f"https://t.me/{bot_username}?start=album_{album_info['id']}"
+                )
+            ]])
+
         try:
             await context.bot.edit_message_media(
                 inline_message_id=inline_message_id,
@@ -656,6 +952,7 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
                     performer=artist,
                     duration=duration,
                 ),
+                reply_markup=album_keyboard,
             )
             logger.info(f"[CHOSEN] ✅ Inline message replaced with audio!")
         except Exception as e:
@@ -738,6 +1035,7 @@ def main():
             "message",
             "inline_query",
             "chosen_inline_result",
+            "callback_query",
         ]
     )
 
