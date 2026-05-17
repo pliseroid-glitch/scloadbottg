@@ -695,13 +695,68 @@ def fetch_lyrics(song_url: str, song_id: int = None) -> str | None:
     return None
 
 
+async def handle_empty_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show welcome message + recent downloads when query is empty."""
+    results = []
+
+    # Welcome card
+    results.append(
+        InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title="💛 PliserLoad",
+            description="Напиши название трека или артиста для поиска",
+            thumbnail_url="https://i.imgur.com/8QqZ0Lx.png",
+            input_message_content=InputTextMessageContent(
+                message_text=(
+                    "🎵 PliserLoad Bot\n\n"
+                    "Ищи треки с SoundCloud прямо в чате!\n"
+                    "Добавь «t» в конце запроса для поиска текста песни."
+                ),
+            ),
+        )
+    )
+
+    # Show recent downloads from history
+    history = context.bot_data.get("download_history", [])
+    for item in history[-9:]:  # last 9
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title=f"🕐 {item['title']}",
+                description=item["artist"],
+                thumbnail_url=item.get("artwork", "").replace("-large", "-t300x300") if item.get("artwork") else None,
+                input_message_content=InputTextMessageContent(
+                    message_text=(
+                        f"🎵 {item['title']}\n"
+                        f"👤 {item['artist']}\n\n"
+                        f"⏳ Скачиваю..."
+                    ),
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⏳ Загрузка...", callback_data="noop")
+                ]]),
+            )
+        )
+        # Also store in pending so chosen_inline_result can handle it
+        pending = context.bot_data.setdefault("pending_downloads", {})
+        pending[results[-1].id] = item
+
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
+
+
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query.query.strip()
+
+    # Empty query — show welcome + history
     if not query:
+        await handle_empty_inline(update, context)
         return
 
-    # Check if user wants lyrics (suffix "text" or "текст")
-    if query.lower().endswith(" text") or query.lower().endswith(" текст"):
+    # Check if user wants lyrics (suffix aliases: text, t, текст, т)
+    lower = query.lower()
+    lyrics_suffixes = (" text", " t", " текст", " т")
+    is_lyrics = any(lower.endswith(s) for s in lyrics_suffixes)
+    if is_lyrics:
         # Remove the suffix
         lyrics_query = query.rsplit(" ", 1)[0].strip()
         if not lyrics_query:
@@ -986,6 +1041,18 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=album_keyboard,
             )
             logger.info(f"[CHOSEN] ✅ Inline message replaced with audio!")
+            # Save to download history
+            history = context.bot_data.setdefault("download_history", [])
+            history.append({
+                "track": track,
+                "title": title,
+                "artist": artist,
+                "duration": duration,
+                "artwork": artwork,
+            })
+            # Keep last 20
+            if len(history) > 20:
+                context.bot_data["download_history"] = history[-20:]
         except Exception as e:
             logger.error(f"[CHOSEN] editMessageMedia failed: {type(e).__name__}: {e}")
             # Fallback — just update text
