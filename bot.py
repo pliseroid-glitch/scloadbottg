@@ -705,7 +705,7 @@ async def handle_empty_inline(update: Update, context: ContextTypes.DEFAULT_TYPE
             id=str(uuid.uuid4()),
             title="💛 PliserLoad",
             description="Напиши название трека или артиста для поиска",
-            thumbnail_url="https://i.imgur.com/8QqZ0Lx.png",
+            thumbnail_url="https://upload.wikimedia.org/wikipedia/commons/c/c0/Manul_Timofey_in_April_2025_%281%2C_cropped%29.jpg",
             input_message_content=InputTextMessageContent(
                 message_text=(
                     "🎵 PliserLoad Bot\n\n"
