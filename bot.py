@@ -277,27 +277,18 @@ async def fetch_album_tracks(playlist_id: int) -> dict | None:
 
 
 async def get_track_album(track: dict) -> dict | None:
-    """Check if a track belongs to an album/playlist. Returns album info or None."""
-    # SoundCloud API: track has 'publisher_metadata' with 'album_title'
-    # But to get the actual playlist we need to search
-    # The track object from search may have 'playlist' or we check via user's playlists
-    # Simpler: check if track has publisher_metadata.album_title
-    pub = track.get("publisher_metadata") or {}
-    album_title = pub.get("album_title")
-    if not album_title:
-        return None
-
-    # Search for the album by the same artist
-    artist = track.get("user", {}).get("permalink", "")
-    if not artist:
+    """Check if a track belongs to an album. Searches user's playlists."""
+    track_id = track.get("id")
+    user_id = track.get("user", {}).get("id")
+    if not track_id or not user_id:
         return None
 
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
         client_id = await get_soundcloud_client_id(session)
         if not client_id:
             return None
-        # Search playlists by artist
-        url = f"https://api-v2.soundcloud.com/users/{track['user']['id']}/playlists"
+
+        url = f"https://api-v2.soundcloud.com/users/{user_id}/playlists"
         params = {"client_id": client_id, "limit": 50}
         try:
             async with session.get(url, params=params) as resp:
@@ -305,15 +296,22 @@ async def get_track_album(track: dict) -> dict | None:
                     return None
                 data = await resp.json()
                 playlists = data.get("collection", [])
+
                 for pl in playlists:
-                    if pl.get("title", "").lower() == album_title.lower():
-                        return {
-                            "id": pl.get("id"),
-                            "title": pl.get("title"),
-                            "artist": track.get("user", {}).get("username", "Unknown"),
-                            "artwork": pl.get("artwork_url") or track.get("artwork_url"),
-                            "track_count": pl.get("track_count", 0),
-                        }
+                    # Only consider albums, not singles
+                    if pl.get("set_type") not in ("album", "ep", "compilation"):
+                        continue
+                    # Check if our track is in this playlist
+                    pl_tracks = pl.get("tracks", [])
+                    for t in pl_tracks:
+                        if t.get("id") == track_id:
+                            return {
+                                "id": pl.get("id"),
+                                "title": pl.get("title"),
+                                "artist": track.get("user", {}).get("username", "Unknown"),
+                                "artwork": pl.get("artwork_url") or track.get("artwork_url"),
+                                "track_count": pl.get("track_count", 0),
+                            }
         except Exception as e:
             logger.warning(f"[ALBUM] Search failed: {e}")
     return None
