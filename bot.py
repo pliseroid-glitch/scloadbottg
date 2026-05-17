@@ -454,6 +454,10 @@ async def handle_album_deeplink(update: Update, context: ContextTypes.DEFAULT_TY
     artwork = album_data.get("artwork_url") or ""
     tracks = album_data.get("tracks", [])
 
+    # Fallback: use first track's artwork if album has none
+    if not artwork and tracks:
+        artwork = tracks[0].get("artwork_url") or ""
+
     if not tracks:
         await update.message.reply_text("❌ В альбоме нет треков.")
         return
@@ -478,13 +482,20 @@ async def handle_album_deeplink(update: Update, context: ContextTypes.DEFAULT_TY
     if artwork:
         thumb = await download_artwork(artwork.replace("-large", "-t500x500"))
         if thumb:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=thumb,
-                caption=text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
+            if len(text) <= 1024:
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=thumb,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            else:
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=thumb,
+                )
+                await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
             return
 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
