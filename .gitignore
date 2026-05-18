@@ -4,3 +4,4 @@ __pycache__/
 downloads/
 venv/
 cache.json
+history.json

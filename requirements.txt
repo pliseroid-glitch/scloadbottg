@@ -4,4 +4,4 @@ python-dotenv==1.0.1
 lyricsgenius==3.0.1
 beautifulsoup4==4.12.3
 requests==2.32.3
-yt-dlp==2026.3.17
+yt-dlp @ https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.tar.gz
