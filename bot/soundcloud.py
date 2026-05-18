@@ -171,10 +171,17 @@ def is_track_blocked(track: dict) -> bool:
         return True
     if track.get("access") == "preview":
         return True
+    # Эвристика: duration=30s при full_duration >> 30s — это preview-only
+    duration = track.get("duration", 0)
+    full_duration = track.get("full_duration", 0)
+    if duration and full_duration and duration <= 30000 and full_duration > duration * 2:
+        return True
     transcodings = (track.get("media") or {}).get("transcodings") or []
-    return bool(transcodings) and all(
-        "/preview/" in (t.get("url") or "") for t in transcodings
-    )
+    if not transcodings:
+        return False
+    # Если все transcodings ведут на /preview/ — полная версия закрыта
+    full = [t for t in transcodings if "/preview/" not in (t.get("url") or "")]
+    return len(full) == 0
 
 
 async def download_track(track: dict) -> str | None:
