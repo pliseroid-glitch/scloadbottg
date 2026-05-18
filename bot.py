@@ -246,8 +246,25 @@ async def fetch_track_fresh(track_id: int, client_id: str) -> dict | None:
         return None
 
 
+def pick_transcoding(transcodings: list[dict], prefer: str = "progressive") -> dict | None:
+    """
+    Выбираем подходящий вариант стрима для ручного скачивания.
+    progressive — обычный mp3 одним запросом.
+    hls — поток сегментов, склеиваем через ffmpeg.
+    """
+    if not transcodings:
+        return None
+    for t in transcodings:
+        if t.get("format", {}).get("protocol") == prefer:
+            return t
+    for t in transcodings:
+        if t.get("format", {}).get("protocol") in ("progressive", "hls"):
+            return t
+    return transcodings[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# SoundCloud: скачивание (через yt-dlp)
+# SoundCloud: скачивание (yt-dlp + ручной fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Параметры yt-dlp общие для всех загрузок. Прячем шум в логах,
@@ -269,68 +286,165 @@ _YTDLP_OPTS_BASE: dict[str, Any] = {
 }
 
 
+def _patch_ytdlp_client_id(client_id: str) -> None:
+    """
+    yt-dlp хранит client_id в классе SoundcloudBaseIE и иногда отстаёт
+    от SoundCloud — у них хардкод устаревает быстрее, чем выходят релизы.
+    Подменяем его на наш, который мы только что выдрали со страницы.
+    """
+    try:
+        from yt_dlp.extractor.soundcloud import SoundcloudBaseIE
+        SoundcloudBaseIE._CLIENT_ID = client_id
+    except Exception as e:
+        logger.warning(f"[DOWNLOAD] не подсунул client_id в yt-dlp: {e}")
+
+
 def _ytdlp_download_sync(track_url: str, output_template: str) -> str | None:
-    """
-    Синхронная обёртка над yt-dlp — выполняется в executor.
-    Возвращает путь до итогового mp3 или None.
-    """
+    """Синхронная обёртка над yt-dlp — выполняется в executor."""
     opts = {**_YTDLP_OPTS_BASE, "outtmpl": output_template}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(track_url, download=True)
-            # После постпроцессора файл всегда .mp3 — берём базу из template
-            path = ydl.prepare_filename(info)
-            mp3 = Path(path).with_suffix(".mp3")
+            mp3 = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
             return str(mp3) if mp3.exists() else None
     except yt_dlp.utils.DownloadError as e:
-        # Самые частые случаи: трек удалён, гео-блок, Go+
-        logger.error(f"[DOWNLOAD] yt-dlp: {e}")
+        # Самые частые случаи: трек удалён, гео-блок, Go+, протухший client_id
+        logger.warning(f"[DOWNLOAD] yt-dlp: {e}")
     except Exception as e:
-        logger.error(f"[DOWNLOAD] yt-dlp: {type(e).__name__}: {e}")
+        logger.warning(f"[DOWNLOAD] yt-dlp: {type(e).__name__}: {e}")
     return None
 
 
 async def download_track(track: dict) -> str | None:
     """
-    Скачиваем один трек через yt-dlp. Возвращает путь до mp3 или None.
-
-    yt-dlp сам разберётся с client_id, track_authorization, выбором стрима
-    (progressive/HLS) и конвертацией в mp3 через ffmpeg — нам остаётся только
-    подсунуть permalink и подождать.
+    Скачиваем один трек. Сначала пробуем yt-dlp (он сам разруливает
+    client_id, выбор стрима и конвертацию), при неудаче падаем в ручной
+    режим — он берёт transcodings из api-v2 и сам склеивает HLS через ffmpeg.
     """
     title = track.get("title", "track")
+    track_id = track.get("id")
+    local_name = uuid.uuid4().hex[:8]
 
-    # Нужен permalink_url — yt-dlp работает с публичными ссылками SoundCloud,
-    # а не с api-v2 эндпоинтами. В свежих данных он есть всегда.
+    # Свежие данные = свежий permalink_url, transcodings и track_authorization.
+    # yt-dlp всё равно уходит в /resolve по permalink, так что данные нужны актуальные.
+    client_id = await get_client_id()
+    if track_id and client_id:
+        fresh = await fetch_track_fresh(track_id, client_id)
+        if fresh:
+            track = fresh
+
+    # Шаг 1 — пробуем yt-dlp
     track_url = track.get("permalink_url")
-    if not track_url:
-        # На всякий случай — догружаем по id
-        track_id = track.get("id")
-        if track_id:
-            client_id = await get_client_id()
-            if client_id:
-                fresh = await fetch_track_fresh(track_id, client_id)
-                if fresh:
-                    track_url = fresh.get("permalink_url")
+    if track_url and client_id:
+        _patch_ytdlp_client_id(client_id)
+        template = str(DOWNLOADS_DIR / f"{local_name}.%(ext)s")
+        logger.info(f"[DOWNLOAD] '{title}' → yt-dlp")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, _ytdlp_download_sync, track_url, template
+        )
+        if result:
+            size_mb = Path(result).stat().st_size / 1024 / 1024
+            logger.info(f"[DOWNLOAD] ✅ {Path(result).name} ({size_mb:.1f} MB)")
+            return result
+        logger.info(f"[DOWNLOAD] yt-dlp не справился, пробую ручной режим")
 
-    if not track_url:
-        logger.error(f"[DOWNLOAD] нет permalink_url для '{title}'")
+    # Шаг 2 — fallback: качаем сами через api-v2 transcodings
+    return await _download_manual(track, local_name)
+
+
+async def _download_manual(track: dict, local_name: str) -> str | None:
+    """Ручной даунлоадер: получаем stream URL через api-v2 и скачиваем сами."""
+    title = track.get("title", "track")
+
+    client_id = await get_client_id()
+    if not client_id:
         return None
 
-    # Локальное имя — чтобы не пересекаться с параллельными скачиваниями
-    local_name = uuid.uuid4().hex[:8]
-    template = str(DOWNLOADS_DIR / f"{local_name}.%(ext)s")
+    transcoding = pick_transcoding((track.get("media") or {}).get("transcodings") or [])
+    if not transcoding:
+        logger.error(f"[DOWNLOAD] нет transcodings для '{title}'")
+        return None
 
-    logger.info(f"[DOWNLOAD] '{title}' → yt-dlp")
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None, _ytdlp_download_sync, track_url, template
-    )
+    stream_api_url = transcoding.get("url")
+    protocol = transcoding.get("format", {}).get("protocol")
+    track_auth = track.get("track_authorization", "")
+    logger.info(f"[DOWNLOAD] manual '{title}' protocol={protocol}")
 
-    if result:
-        size_mb = Path(result).stat().st_size / 1024 / 1024
-        logger.info(f"[DOWNLOAD] ✅ {Path(result).name} ({size_mb:.1f} MB)")
-    return result
+    # Сначала пробуем с текущим client_id, на 401/403 — перевыпускаем
+    stream_url = await _resolve_stream_url(stream_api_url, client_id, track_auth)
+    if not stream_url:
+        new_cid = await get_client_id(force=True)
+        if new_cid and new_cid != client_id:
+            stream_url = await _resolve_stream_url(stream_api_url, new_cid, track_auth)
+    if not stream_url:
+        return None
+
+    output_path = DOWNLOADS_DIR / f"{local_name}.mp3"
+    if protocol == "progressive":
+        return await _download_progressive(stream_url, output_path)
+    return await _download_hls(stream_url, output_path)
+
+
+async def _resolve_stream_url(api_url: str, client_id: str, track_auth: str) -> str | None:
+    """SoundCloud отдаёт промежуточный URL — он содержит реальную ссылку на mp3/HLS."""
+    params: dict[str, str] = {"client_id": client_id}
+    if track_auth:
+        params["track_authorization"] = track_auth
+    try:
+        async with _http.get(api_url, params=params) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error(f"[DOWNLOAD] resolve stream {resp.status}: {body[:200]}")
+                return None
+            return (await resp.json()).get("url")
+    except Exception as e:
+        logger.error(f"[DOWNLOAD] resolve stream: {e}")
+        return None
+
+
+async def _download_progressive(stream_url: str, output_path: Path) -> str | None:
+    """Качаем обычный mp3 одним запросом."""
+    try:
+        async with _http.get(stream_url) as resp:
+            if resp.status != 200:
+                logger.error(f"[DOWNLOAD] HTTP {resp.status}")
+                return None
+            total = 0
+            with open(output_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1 << 15):
+                    f.write(chunk)
+                    total += len(chunk)
+        logger.info(f"[DOWNLOAD] ✅ {output_path.name} ({total / 1024 / 1024:.1f} MB)")
+        return str(output_path)
+    except Exception as e:
+        logger.error(f"[DOWNLOAD] progressive: {e}")
+        return None
+
+
+async def _download_hls(stream_url: str, output_path: Path) -> str | None:
+    """Собираем HLS через ffmpeg — он сам подтянет все сегменты и склеит в mp3."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", stream_url,
+            "-c:a", "libmp3lame", "-b:a", "256k",
+            str(output_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(f"[DOWNLOAD] ffmpeg: {stderr.decode(errors='ignore')[:300]}")
+            return None
+        if output_path.exists():
+            logger.info(f"[DOWNLOAD] ✅ {output_path.name} (через ffmpeg)")
+            return str(output_path)
+    except FileNotFoundError:
+        logger.error("[DOWNLOAD] ffmpeg не установлен")
+    except Exception as e:
+        logger.error(f"[DOWNLOAD] hls: {e}")
+    return None
 
 
 async def download_artwork(url: str) -> bytes | None:
