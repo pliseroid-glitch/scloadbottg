@@ -63,6 +63,10 @@ DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 CACHE_FILE = Path("cache.json")
+HISTORY_FILE = Path("history.json")  # per-user история скачиваний
+
+# Сколько треков хранить в истории каждого пользователя
+HISTORY_LIMIT = 50
 
 # Лимиты Telegram, к которым привязываемся в нескольких местах
 TG_MESSAGE_LIMIT = 4096
@@ -156,6 +160,67 @@ def cache_set(track_id: int, file_id: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# История скачиваний (per-user, персистентная)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Структура: {user_id_str: [{title, artist, duration, artwork, track}, ...]}
+_user_history: dict[str, list[dict]] = {}
+
+
+def load_history() -> None:
+    """Подгружаем history.json при старте."""
+    if not HISTORY_FILE.exists():
+        return
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _user_history.update(data)
+            total = sum(len(v) for v in _user_history.values())
+            logger.info(f"[HISTORY] загружено {total} записей для {len(_user_history)} юзеров")
+    except Exception as e:
+        logger.warning(f"[HISTORY] не смог прочитать history.json: {e}")
+
+
+def save_history() -> None:
+    """Сохраняем историю на диск."""
+    try:
+        HISTORY_FILE.write_text(
+            json.dumps(_user_history, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning(f"[HISTORY] не смог сохранить history.json: {e}")
+
+
+def history_get(user_id: int) -> list[dict]:
+    """Получить историю конкретного пользователя."""
+    return _user_history.get(str(user_id), [])
+
+
+def history_push(user_id: int, item: dict) -> None:
+    """Добавить трек в историю пользователя и сохранить."""
+    key = str(user_id)
+    if key not in _user_history:
+        _user_history[key] = []
+
+    # Не дублируем — если трек уже есть, перемещаем в конец
+    track_id = (item.get("track") or {}).get("id")
+    if track_id:
+        _user_history[key] = [
+            h for h in _user_history[key]
+            if (h.get("track") or {}).get("id") != track_id
+        ]
+
+    _user_history[key].append(item)
+
+    # Обрезаем до лимита
+    if len(_user_history[key]) > HISTORY_LIMIT:
+        _user_history[key] = _user_history[key][-HISTORY_LIMIT:]
+
+    save_history()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SoundCloud: client_id
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -240,7 +305,17 @@ async def fetch_track_fresh(track_id: int, client_id: str) -> dict | None:
             if resp.status != 200:
                 logger.warning(f"[REFRESH] HTTP {resp.status} для трека {track_id}")
                 return None
-            return await resp.json()
+            data = await resp.json()
+            # Диагностика: есть ли нужные поля
+            has_auth = bool(data.get("track_authorization"))
+            transcodings = (data.get("media") or {}).get("transcodings") or []
+            logger.info(
+                f"[REFRESH] трек {track_id}: "
+                f"track_auth={'есть' if has_auth else 'НЕТ'}, "
+                f"transcodings={len(transcodings)}, "
+                f"permalink={data.get('permalink_url', 'N/A')[:50]}"
+            )
+            return data
     except Exception as e:
         logger.warning(f"[REFRESH] {e}")
         return None
@@ -251,16 +326,24 @@ def pick_transcoding(transcodings: list[dict], prefer: str = "progressive") -> d
     Выбираем подходящий вариант стрима для ручного скачивания.
     progressive — обычный mp3 одним запросом.
     hls — поток сегментов, склеиваем через ffmpeg.
+
+    Пропускаем /preview/ URL-ы — это 30-секундные огрызки для лейбловых треков.
     """
     if not transcodings:
         return None
-    for t in transcodings:
+
+    # Отсеиваем preview-транскодинги — они бесполезны
+    full = [t for t in transcodings if "/preview/" not in (t.get("url") or "")]
+    if not full:
+        return None  # все варианты — preview, трек недоступен
+
+    for t in full:
         if t.get("format", {}).get("protocol") == prefer:
             return t
-    for t in transcodings:
+    for t in full:
         if t.get("format", {}).get("protocol") in ("progressive", "hls"):
             return t
-    return transcodings[0]
+    return full[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,24 +400,29 @@ def _ytdlp_download_sync(track_url: str, output_template: str) -> str | None:
 
 async def download_track(track: dict) -> str | None:
     """
-    Скачиваем один трек. Сначала пробуем yt-dlp (он сам разруливает
-    client_id, выбор стрима и конвертацию), при неудаче падаем в ручной
-    режим — он берёт transcodings из api-v2 и сам склеивает HLS через ffmpeg.
+    Скачиваем один трек. Порядок попыток:
+      1. yt-dlp — хорош для обычных треков.
+      2. Ручной режим через api-v2 transcodings — последний шанс.
     """
     title = track.get("title", "track")
     track_id = track.get("id")
     local_name = uuid.uuid4().hex[:8]
 
     # Свежие данные = свежий permalink_url, transcodings и track_authorization.
-    # yt-dlp всё равно уходит в /resolve по permalink, так что данные нужны актуальные.
     client_id = await get_client_id()
     if track_id and client_id:
         fresh = await fetch_track_fresh(track_id, client_id)
         if fresh:
             track = fresh
 
-    # Шаг 1 — пробуем yt-dlp
+    # Проверяем, не заблокирован ли трек (лейбл, Go+, preview-only)
+    if is_track_blocked(track):
+        logger.info(f"[DOWNLOAD] '{title}' заблокирован (лейбл/Go+), пропускаю")
+        return None
+
     track_url = track.get("permalink_url")
+
+    # Шаг 1 — yt-dlp
     if track_url and client_id:
         _patch_ytdlp_client_id(client_id)
         template = str(DOWNLOADS_DIR / f"{local_name}.%(ext)s")
@@ -345,42 +433,77 @@ async def download_track(track: dict) -> str | None:
         )
         if result:
             size_mb = Path(result).stat().st_size / 1024 / 1024
-            logger.info(f"[DOWNLOAD] ✅ {Path(result).name} ({size_mb:.1f} MB)")
+            logger.info(f"[DOWNLOAD] ✅ yt-dlp: {Path(result).name} ({size_mb:.1f} MB)")
             return result
-        logger.info(f"[DOWNLOAD] yt-dlp не справился, пробую ручной режим")
+        logger.info("[DOWNLOAD] yt-dlp не справился, пробую ручной режим")
 
     # Шаг 2 — fallback: качаем сами через api-v2 transcodings
     return await _download_manual(track, local_name)
 
 
 async def _download_manual(track: dict, local_name: str) -> str | None:
-    """Ручной даунлоадер: получаем stream URL через api-v2 и скачиваем сами."""
+    """
+    Ручной даунлоадер: получаем stream URL через api-v2 и скачиваем сами.
+
+    Важный нюанс: track_authorization привязан к client_id, с которым
+    запрашивались данные трека. Если client_id протух и мы его обновили,
+    нужно заново дёрнуть fetch_track_fresh — иначе старый track_authorization
+    тоже не пройдёт.
+    """
     title = track.get("title", "track")
+    track_id = track.get("id")
 
     client_id = await get_client_id()
     if not client_id:
         return None
 
+    # Попытка 1: с текущими данными
+    stream_url, protocol, output_path = await _try_resolve(track, client_id, local_name)
+    if stream_url:
+        return await _fetch_audio(stream_url, protocol, output_path)
+
+    # Попытка 2: обновляем client_id и перезапрашиваем данные трека целиком
+    logger.info(f"[DOWNLOAD] обновляю client_id и перезапрашиваю трек '{title}'")
+    new_cid = await get_client_id(force=True)
+    if not new_cid:
+        return None
+
+    if track_id:
+        fresh = await fetch_track_fresh(track_id, new_cid)
+        if fresh:
+            track = fresh
+
+    stream_url, protocol, output_path = await _try_resolve(track, new_cid, local_name)
+    if stream_url:
+        return await _fetch_audio(stream_url, protocol, output_path)
+
+    logger.error(f"[DOWNLOAD] не удалось скачать '{title}' ни одним способом")
+    return None
+
+
+async def _try_resolve(
+    track: dict, client_id: str, local_name: str
+) -> tuple[str | None, str | None, Path | None]:
+    """Пробуем получить stream URL из transcodings трека."""
     transcoding = pick_transcoding((track.get("media") or {}).get("transcodings") or [])
     if not transcoding:
-        logger.error(f"[DOWNLOAD] нет transcodings для '{title}'")
-        return None
+        return None, None, None
 
     stream_api_url = transcoding.get("url")
     protocol = transcoding.get("format", {}).get("protocol")
     track_auth = track.get("track_authorization", "")
-    logger.info(f"[DOWNLOAD] manual '{title}' protocol={protocol}")
 
-    # Сначала пробуем с текущим client_id, на 401/403 — перевыпускаем
+    logger.info(f"[DOWNLOAD] manual '{track.get('title', '?')}' protocol={protocol}")
+
     stream_url = await _resolve_stream_url(stream_api_url, client_id, track_auth)
-    if not stream_url:
-        new_cid = await get_client_id(force=True)
-        if new_cid and new_cid != client_id:
-            stream_url = await _resolve_stream_url(stream_api_url, new_cid, track_auth)
-    if not stream_url:
-        return None
-
     output_path = DOWNLOADS_DIR / f"{local_name}.mp3"
+    return stream_url, protocol, output_path
+
+
+async def _fetch_audio(
+    stream_url: str, protocol: str | None, output_path: Path
+) -> str | None:
+    """Скачиваем аудио по уже зарезолвленному URL."""
     if protocol == "progressive":
         return await _download_progressive(stream_url, output_path)
     return await _download_hls(stream_url, output_path)
@@ -391,13 +514,26 @@ async def _resolve_stream_url(api_url: str, client_id: str, track_auth: str) -> 
     params: dict[str, str] = {"client_id": client_id}
     if track_auth:
         params["track_authorization"] = track_auth
+
+    logger.info(
+        f"[DOWNLOAD] resolve: url={api_url[:80]}... "
+        f"client_id={client_id[:8]}... "
+        f"track_auth={'есть' if track_auth else 'НЕТ'} ({len(track_auth)} chars)"
+    )
+
     try:
         async with _http.get(api_url, params=params) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                logger.error(f"[DOWNLOAD] resolve stream {resp.status}: {body[:200]}")
+                logger.error(
+                    f"[DOWNLOAD] resolve stream {resp.status}: {body[:300]}"
+                )
                 return None
-            return (await resp.json()).get("url")
+            data = await resp.json()
+            url = data.get("url")
+            if not url:
+                logger.error(f"[DOWNLOAD] resolve stream: ответ без 'url': {data}")
+            return url
     except Exception as e:
         logger.error(f"[DOWNLOAD] resolve stream: {e}")
         return None
@@ -737,10 +873,21 @@ def format_duration(ms: int) -> str:
 
 
 def is_track_blocked(track: dict) -> bool:
-    """Платный/обрезанный трек — полный mp3 недоступен, можно скачать только превью."""
+    """
+    Платный/обрезанный трек — полный mp3 недоступен, можно скачать только превью.
+
+    SoundCloud помечает такие треки несколькими способами:
+    - policy: "BLOCK" или "SNIP"
+    - monetization_model: "SUB_HIGH_TIER" (Go+ exclusive)
+    - access: "preview" (вместо "playable")
+    - все transcodings ведут на /preview/ URL
+    """
     if track.get("policy") in ("BLOCK", "SNIP"):
         return True
     if track.get("monetization_model") == "SUB_HIGH_TIER":
+        return True
+    # access == "preview" — лейбл закрыл полный стрим
+    if track.get("access") == "preview":
         return True
     transcodings = (track.get("media") or {}).get("transcodings") or []
     # Если все ссылки на стрим ведут в /preview/ — полная версия закрыта
@@ -1098,7 +1245,8 @@ async def handle_empty_inline(update: Update, context: ContextTypes.DEFAULT_TYPE
     ]
 
     pending = context.bot_data.setdefault("pending_downloads", {})
-    history = context.bot_data.get("download_history", [])
+    user_id = update.inline_query.from_user.id
+    history = history_get(user_id)
 
     # Показываем последние 9 — итого 10 карточек вместе с приветствием
     for item in history[-9:]:
@@ -1301,13 +1449,14 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.info("[CHOSEN] трек заблокирован, скачивание не запускаем")
         return
 
-    await handle_chosen_track(context, inline_message_id, info)
+    await handle_chosen_track(context, inline_message_id, info, chosen.from_user.id)
 
 
 async def handle_chosen_track(
     context: ContextTypes.DEFAULT_TYPE,
     inline_message_id: str | None,
     info: dict,
+    user_id: int,
 ) -> None:
     """Качаем трек (или достаём из кэша) и подменяем инлайн-сообщение на аудио."""
     track = info["track"]
@@ -1357,7 +1506,7 @@ async def handle_chosen_track(
             reply_markup=keyboard,
         )
         logger.info("[CHOSEN] ✅ инлайн-сообщение заменено на аудио")
-        _push_history(context, track, title, artist, duration, artwork)
+        _push_history(user_id, track, title, artist, duration, artwork)
     except Exception as e:
         logger.error(f"[CHOSEN] editMessageMedia упал: {type(e).__name__}: {e}")
         await _try_edit_inline(
@@ -1389,24 +1538,21 @@ async def _download_and_upload(
 
 
 def _push_history(
-    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
     track: dict,
     title: str,
     artist: str,
     duration: int,
     artwork: str,
 ) -> None:
-    """Добавляем трек в историю, держим только последние 20."""
-    history = context.bot_data.setdefault("download_history", [])
-    history.append({
+    """Добавляем трек в персональную историю пользователя."""
+    history_push(user_id, {
         "track": track,
         "title": title,
         "artist": artist,
         "duration": duration,
         "artwork": artwork,
     })
-    if len(history) > 20:
-        context.bot_data["download_history"] = history[-20:]
 
 
 async def handle_chosen_lyrics(
@@ -1482,6 +1628,7 @@ async def _on_startup(app: Application) -> None:
     global _http
     _http = aiohttp.ClientSession(headers=DEFAULT_HEADERS)
     load_cache()
+    load_history()
     logger.info("Бот запущен!")
 
 
