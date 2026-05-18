@@ -98,6 +98,19 @@ async def search_tracks(query: str) -> list[dict]:
 
     tracks = data.get("collection", [])
     logger.info(f"[SEARCH] '{query}' → {len(tracks)} треков")
+
+    # DEBUG: логируем поля, влияющие на is_track_blocked
+    for t in tracks[:3]:
+        transcodings = (t.get("media") or {}).get("transcodings") or []
+        tc_urls = [tc.get("url", "")[:60] for tc in transcodings[:2]]
+        logger.info(
+            f"[SEARCH DEBUG] '{t.get('title', '?')[:30]}' "
+            f"policy={t.get('policy')} access={t.get('access')} "
+            f"monetization={t.get('monetization_model')} "
+            f"duration={t.get('duration')} full_duration={t.get('full_duration')} "
+            f"transcodings={tc_urls}"
+        )
+
     return tracks
 
 
@@ -149,6 +162,10 @@ def _patch_ytdlp_client_id(client_id: str) -> None:
         logger.warning(f"[DOWNLOAD] не подсунул client_id в yt-dlp: {e}")
 
 
+# Специальный маркер: yt-dlp обнаружил DRM-защиту
+DRM_MARKER = "__DRM__"
+
+
 def _ytdlp_download_sync(track_url: str, output_template: str) -> str | None:
     opts = {**_YTDLP_OPTS_BASE, "outtmpl": output_template}
     try:
@@ -157,6 +174,10 @@ def _ytdlp_download_sync(track_url: str, output_template: str) -> str | None:
             mp3 = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
             return str(mp3) if mp3.exists() else None
     except yt_dlp.utils.DownloadError as e:
+        err_msg = str(e)
+        if "DRM" in err_msg:
+            logger.info(f"[DOWNLOAD] yt-dlp: трек защищён DRM")
+            return DRM_MARKER
         logger.warning(f"[DOWNLOAD] yt-dlp: {e}")
     except Exception as e:
         logger.warning(f"[DOWNLOAD] yt-dlp: {type(e).__name__}: {e}")
@@ -209,6 +230,8 @@ async def download_track(track: dict) -> str | None:
         logger.info(f"[DOWNLOAD] '{title}' → yt-dlp")
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, _ytdlp_download_sync, track_url, template)
+        if result == DRM_MARKER:
+            return DRM_MARKER
         if result:
             size_mb = Path(result).stat().st_size / 1024 / 1024
             logger.info(f"[DOWNLOAD] ✅ yt-dlp: {Path(result).name} ({size_mb:.1f} MB)")
