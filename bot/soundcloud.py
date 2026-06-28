@@ -4,13 +4,11 @@ import re
 import uuid
 import asyncio
 from pathlib import Path
-from typing import Any
 
 import aiohttp
-import yt_dlp
 
 from .config import (
-    BROWSER_UA, DEFAULT_HEADERS, DOWNLOADS_DIR, INLINE_RESULTS_LIMIT, logger,
+    DEFAULT_HEADERS, DOWNLOADS_DIR, INLINE_RESULTS_LIMIT, logger,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,18 +45,24 @@ async def get_client_id(force: bool = False) -> str | None:
             return _client_id
 
         try:
-            async with _http.get("https://soundcloud.com/") as resp:
+            async with _http.get("https://soundcloud.com/", headers=DEFAULT_HEADERS) as resp:
                 html = await resp.text()
         except Exception as e:
             logger.error(f"[CLIENT_ID] не открыл главную SoundCloud: {e}")
             return None
 
         scripts = re.findall(
-            r'src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', html
+            r'src="([^"]+\.js)"', html
         )
         for script_url in reversed(scripts):
+            if script_url.startswith("//"):
+                script_url = "https:" + script_url
+            elif script_url.startswith("/"):
+                script_url = "https://soundcloud.com" + script_url
+            elif not script_url.startswith("http"):
+                script_url = "https://soundcloud.com/" + script_url
             try:
-                async with _http.get(script_url) as resp:
+                async with _http.get(script_url, headers=DEFAULT_HEADERS) as resp:
                     js = await resp.text()
             except Exception:
                 continue
@@ -87,7 +91,7 @@ async def search_tracks(query: str) -> list[dict]:
     params = {"q": query, "client_id": client_id, "limit": INLINE_RESULTS_LIMIT, "offset": 0}
 
     try:
-        async with _http.get(url, params=params) as resp:
+        async with _http.get(url, params=params, headers=DEFAULT_HEADERS) as resp:
             if resp.status != 200:
                 logger.error(f"[SEARCH] HTTP {resp.status}")
                 return []
@@ -118,7 +122,7 @@ async def fetch_track_fresh(track_id: int, client_id: str) -> dict | None:
     """Берём свежие данные трека по id."""
     url = f"https://api-v2.soundcloud.com/tracks/{track_id}"
     try:
-        async with _http.get(url, params={"client_id": client_id}) as resp:
+        async with _http.get(url, params={"client_id": client_id}, headers=DEFAULT_HEADERS) as resp:
             if resp.status != 200:
                 logger.warning(f"[REFRESH] HTTP {resp.status} для трека {track_id}")
                 return None
@@ -138,51 +142,8 @@ async def fetch_track_fresh(track_id: int, client_id: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Скачивание (yt-dlp + ручной fallback)
+# Скачивание
 # ─────────────────────────────────────────────────────────────────────────────
-
-_YTDLP_OPTS_BASE: dict[str, Any] = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "no_warnings": True,
-    "noprogress": True,
-    "nocheckcertificate": True,
-    "http_headers": {"User-Agent": BROWSER_UA},
-    "postprocessors": [
-        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "256"}
-    ],
-}
-
-
-def _patch_ytdlp_client_id(client_id: str) -> None:
-    try:
-        from yt_dlp.extractor.soundcloud import SoundcloudBaseIE
-        SoundcloudBaseIE._CLIENT_ID = client_id
-    except Exception as e:
-        logger.warning(f"[DOWNLOAD] не подсунул client_id в yt-dlp: {e}")
-
-
-# Специальный маркер: yt-dlp обнаружил DRM-защиту
-DRM_MARKER = "__DRM__"
-
-
-def _ytdlp_download_sync(track_url: str, output_template: str) -> str | None:
-    opts = {**_YTDLP_OPTS_BASE, "outtmpl": output_template}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(track_url, download=True)
-            mp3 = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
-            return str(mp3) if mp3.exists() else None
-    except yt_dlp.utils.DownloadError as e:
-        err_msg = str(e)
-        if "DRM" in err_msg:
-            logger.info(f"[DOWNLOAD] yt-dlp: трек защищён DRM")
-            return DRM_MARKER
-        logger.warning(f"[DOWNLOAD] yt-dlp: {e}")
-    except Exception as e:
-        logger.warning(f"[DOWNLOAD] yt-dlp: {type(e).__name__}: {e}")
-    return None
-
 
 def is_track_blocked(track: dict) -> bool:
     """Платный/обрезанный трек — полный mp3 недоступен."""
@@ -206,7 +167,7 @@ def is_track_blocked(track: dict) -> bool:
 
 
 async def download_track(track: dict) -> str | None:
-    """Скачиваем один трек. yt-dlp → ручной fallback."""
+    """Скачиваем один трек напрямую (ручной режим)."""
     title = track.get("title", "track")
     track_id = track.get("id")
     local_name = uuid.uuid4().hex[:8]
@@ -221,24 +182,6 @@ async def download_track(track: dict) -> str | None:
         logger.info(f"[DOWNLOAD] '{title}' заблокирован (лейбл/Go+), пропускаю")
         return None
 
-    track_url = track.get("permalink_url")
-
-    # Шаг 1 — yt-dlp
-    if track_url and client_id:
-        _patch_ytdlp_client_id(client_id)
-        template = str(DOWNLOADS_DIR / f"{local_name}.%(ext)s")
-        logger.info(f"[DOWNLOAD] '{title}' → yt-dlp")
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _ytdlp_download_sync, track_url, template)
-        if result == DRM_MARKER:
-            return DRM_MARKER
-        if result:
-            size_mb = Path(result).stat().st_size / 1024 / 1024
-            logger.info(f"[DOWNLOAD] ✅ yt-dlp: {Path(result).name} ({size_mb:.1f} MB)")
-            return result
-        logger.info("[DOWNLOAD] yt-dlp не справился, пробую ручной режим")
-
-    # Шаг 2 — fallback
     return await _download_manual(track, local_name)
 
 
@@ -303,7 +246,7 @@ async def _try_resolve(track: dict, client_id: str, local_name: str):
         params["track_authorization"] = track_auth
 
     try:
-        async with _http.get(stream_api_url, params=params) as resp:
+        async with _http.get(stream_api_url, params=params, headers=DEFAULT_HEADERS) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 logger.error(f"[DOWNLOAD] resolve stream {resp.status}: {body[:300]}")
@@ -329,7 +272,7 @@ async def _fetch_audio(stream_url: str, protocol: str | None, output_path: Path)
 
 async def _download_progressive(stream_url: str, output_path: Path) -> str | None:
     try:
-        async with _http.get(stream_url) as resp:
+        async with _http.get(stream_url, headers=DEFAULT_HEADERS) as resp:
             if resp.status != 200:
                 logger.error(f"[DOWNLOAD] HTTP {resp.status}")
                 return None
@@ -374,7 +317,7 @@ async def download_artwork(url: str) -> bytes | None:
     if not url:
         return None
     try:
-        async with _http.get(url) as resp:
+        async with _http.get(url, headers=DEFAULT_HEADERS) as resp:
             if resp.status == 200:
                 return await resp.read()
     except Exception as e:
@@ -401,7 +344,7 @@ async def fetch_album_tracks(playlist_id: int) -> dict | None:
 
     url = f"https://api-v2.soundcloud.com/playlists/{playlist_id}"
     try:
-        async with _http.get(url, params={"client_id": client_id}) as resp:
+        async with _http.get(url, params={"client_id": client_id}, headers=DEFAULT_HEADERS) as resp:
             if resp.status != 200:
                 logger.warning(f"[ALBUM] HTTP {resp.status} для плейлиста {playlist_id}")
                 return None
@@ -420,7 +363,7 @@ async def fetch_album_tracks(playlist_id: int) -> dict | None:
             params = {"ids": ",".join(map(str, batch)), "client_id": client_id}
             try:
                 async with _http.get(
-                    "https://api-v2.soundcloud.com/tracks", params=params
+                    "https://api-v2.soundcloud.com/tracks", params=params, headers=DEFAULT_HEADERS
                 ) as resp:
                     if resp.status == 200:
                         for t in await resp.json():
@@ -450,7 +393,7 @@ async def get_track_album(track: dict) -> dict | None:
     url = f"https://api-v2.soundcloud.com/users/{user_id}/playlists"
     params = {"client_id": client_id, "limit": 50}
     try:
-        async with _http.get(url, params=params) as resp:
+        async with _http.get(url, params=params, headers=DEFAULT_HEADERS) as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()

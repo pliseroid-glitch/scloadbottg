@@ -1,5 +1,6 @@
 """Genius: поиск и парсинг текстов песен."""
 
+import re
 import requests
 from bs4 import BeautifulSoup
 import lyricsgenius
@@ -94,8 +95,18 @@ def fetch_lyrics(song_url: str) -> str | None:
         return None
 
 
+def _cut_before_first_bracket(raw: str) -> str:
+    """Отрезает весь мусор до первой квадратной скобки [Intro], [Chorus] и т.д."""
+    lines = raw.split("\n")
+    for i, line in enumerate(lines):
+        if re.search(r'\[.*\]', line.strip()):
+            return "\n".join(lines[i:])
+    return raw
+
+
 def _clean_lyrics(raw: str) -> str | None:
     """Срезаем заголовок Genius сверху и навязчивые ссылки снизу."""
+    raw = _cut_before_first_bracket(raw)
     lines = raw.strip().split("\n")
     if lines and ("Lyrics" in lines[0] or "Contributors" in lines[0]):
         lines = lines[1:]

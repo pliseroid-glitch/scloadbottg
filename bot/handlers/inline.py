@@ -18,7 +18,7 @@ from ..config import TG_MESSAGE_LIMIT, INLINE_RESULTS_LIMIT, logger
 from ..storage import cache_get, cache_set, history_get, history_push
 from ..soundcloud import (
     search_tracks, download_track, download_artwork,
-    hires_artwork, get_track_album, is_track_blocked, DRM_MARKER,
+    hires_artwork, get_track_album, is_track_blocked,
 )
 from ..lyrics import search_lyrics, fetch_lyrics
 from ..utils import (
@@ -241,9 +241,6 @@ async def _handle_chosen_track(context, inline_message_id, info, user_id):
         logger.info(f"[CHOSEN] cache hit для трека {track_id}")
     else:
         file_path = await download_track(track)
-        if file_path == DRM_MARKER:
-            await _try_edit(context, inline_message_id, f"🔒 {title}\n\nЭтот трек защищён авторским правом и недоступен для скачивания.")
-            return
         if not file_path or not os.path.exists(file_path):
             logger.error("[CHOSEN] download_track вернул пусто")
             await _try_edit(context, inline_message_id, f"❌ Не удалось скачать: {title}")
@@ -306,7 +303,8 @@ async def _handle_chosen_lyrics(context, inline_message_id, info):
         lyrics = lyrics[:max_len] + "..."
 
     try:
-        await context.bot.edit_message_text(inline_message_id=inline_message_id, text=header + lyrics)
+        text = header + f"<blockquote expandable>{lyrics}</blockquote>"
+        await context.bot.edit_message_text(inline_message_id=inline_message_id, text=text, parse_mode="HTML")
         logger.info(f"[LYRICS] ✅ текст для '{title}' отправлен")
     except Exception as e:
         logger.error(f"[LYRICS] edit упал: {e}")
